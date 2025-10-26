@@ -1,4 +1,4 @@
-Java 21 modified to work with Windows Vista. This build will work on unmodified Vista and networking works now.
+Java 25 modified to work with Windows Vista. This build will work on unmodified Vista and networking works now.
 
 Suggested build command (or you will get missing function errors):
 
@@ -6,6 +6,8 @@ Suggested build command (or you will get missing function errors):
 
 You can also download a pre-compiled release in the releases section.
 
+Another thing, this is targetting unmodified Windows Vista. the Vista extended kernel could cause issues with this that would otherwise not happen on a stock Vista system. 
+Compatibility is not guaranteed with the extended kernel installed.
 
 If you need to contact me for any reason, my Discord server is your best bet.
 
