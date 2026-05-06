@@ -46,15 +46,31 @@ static struct {
     jfieldID path;
 } ids;
 
+/**
+ * GetFinalPathNameByHandle is available on Windows Vista and newer
+ */
+typedef BOOL (WINAPI* GetFinalPathNameByHandleProc) (HANDLE, LPWSTR, DWORD, DWORD);
+static GetFinalPathNameByHandleProc GetFinalPathNameByHandle_func;
+
 JNIEXPORT void JNICALL
 Java_java_io_WinNTFileSystem_initIDs(JNIEnv *env, jclass cls)
 {
+    HMODULE handle;
     jclass fileClass;
 
     fileClass = (*env)->FindClass(env, "java/io/File");
     CHECK_NULL(fileClass);
     ids.path = (*env)->GetFieldID(env, fileClass, "path", "Ljava/lang/String;");
     CHECK_NULL(ids.path);
+
+    // GetFinalPathNameByHandle requires Windows Vista or newer
+    if (GetModuleHandleExW((GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT),
+                           (LPCWSTR)&CreateFileW, &handle) != 0)
+    {
+        GetFinalPathNameByHandle_func = (GetFinalPathNameByHandleProc)
+            GetProcAddress(handle, "GetFinalPathNameByHandleW");
+    }
 }
 
 /* -- Path operations -- */
@@ -71,6 +87,10 @@ static WCHAR* getFinalPath(JNIEnv *env, const WCHAR *path)
     HANDLE h;
     WCHAR *result;
     DWORD error;
+
+    /* Need Windows Vista or newer to get the final path */
+    if (GetFinalPathNameByHandle_func == NULL)
+        return NULL;
 
     h = CreateFileW(path,
                     FILE_READ_ATTRIBUTES,
@@ -89,13 +109,13 @@ static WCHAR* getFinalPath(JNIEnv *env, const WCHAR *path)
      */
     result = (WCHAR*)malloc(MAX_PATH * sizeof(WCHAR));
     if (result != NULL) {
-        DWORD len = GetFinalPathNameByHandleW(h, result, MAX_PATH, 0);
+        DWORD len = (*GetFinalPathNameByHandle_func)(h, result, MAX_PATH, 0);
         if (len >= MAX_PATH) {
             /* retry with a buffer of the right size */
             WCHAR* newResult = (WCHAR*)realloc(result, (len+1) * sizeof(WCHAR));
             if (newResult != NULL) {
                 result = newResult;
-                len = GetFinalPathNameByHandleW(h, result, len, 0);
+                len = (*GetFinalPathNameByHandle_func)(h, result, len, 0);
             } else {
                 len = 0;
                 JNU_ThrowOutOfMemoryError(env, "native memory allocation failed");

@@ -52,7 +52,7 @@
 #include "jfr/jfr.hpp"
 #endif
 
-THREAD_LOCAL Thread* Thread::_thr_current = nullptr;
+ThreadLocalValue<Thread*> Thread::_thr_current(nullptr);
 
 // ======= Thread ========
 // Base class for all threads: VMThread, WatcherThread, ConcurrentMarkSweepThread,

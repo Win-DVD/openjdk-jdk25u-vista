@@ -573,8 +573,37 @@ AC_DEFUN([FLAGS_SETUP_CFLAGS_HELPER],
     TOOLCHAIN_CFLAGS_JDK="$TOOLCHAIN_CFLAGS_JDK -fvisibility=hidden -fstack-protector"
 
   elif test "x$TOOLCHAIN_TYPE" = xmicrosoft; then
-    TOOLCHAIN_CFLAGS_JVM="-nologo -MD -Zc:preprocessor -Zc:inline -Zc:throwingNew -permissive- -MP"
-    TOOLCHAIN_CFLAGS_JDK="-nologo -MD -Zc:preprocessor -Zc:inline -Zc:throwingNew -permissive- -Zc:wchar_t-"
+    ADD_NEW_MSVC_FLAGS=false
+    if test "x$TOOLCHAIN_VERSION" != x; then
+      case $TOOLCHAIN_VERSION in
+        ''|*[!0-9]*) ;;
+        *)
+          if test "$TOOLCHAIN_VERSION" -ge 2019; then
+            ADD_NEW_MSVC_FLAGS=true
+          fi
+          ;;
+      esac
+    elif test "x$VS_VERSION_INTERNAL" != x; then
+      case $VS_VERSION_INTERNAL in
+        ''|*[!0-9]*) ;;
+        *)
+          if test "$VS_VERSION_INTERNAL" -ge 142; then
+            ADD_NEW_MSVC_FLAGS=true
+          fi
+          ;;
+      esac
+    fi
+
+    TOOLCHAIN_CFLAGS_JVM="-nologo -MD -Zc:threadSafeInit-"
+    TOOLCHAIN_CFLAGS_JDK="-nologo -MD -Zc:threadSafeInit-"
+
+    if test "x$ADD_NEW_MSVC_FLAGS" = xtrue; then
+      TOOLCHAIN_CFLAGS_JVM="$TOOLCHAIN_CFLAGS_JVM -Zc:preprocessor"
+      TOOLCHAIN_CFLAGS_JDK="$TOOLCHAIN_CFLAGS_JDK -Zc:preprocessor"
+    fi
+
+    TOOLCHAIN_CFLAGS_JVM="$TOOLCHAIN_CFLAGS_JVM -Zc:strictStrings -MP"
+    TOOLCHAIN_CFLAGS_JDK="$TOOLCHAIN_CFLAGS_JDK -Zc:strictStrings -Zc:wchar_t-"
   fi
 
   # Set character encoding in source
@@ -591,7 +620,10 @@ AC_DEFUN([FLAGS_SETUP_CFLAGS_HELPER],
   if test "x$TOOLCHAIN_TYPE" = xgcc || test "x$TOOLCHAIN_TYPE" = xclang; then
     LANGSTD_CFLAGS="-std=c11"
   elif test "x$TOOLCHAIN_TYPE" = xmicrosoft; then
-    LANGSTD_CFLAGS="-std:c11"
+    LANGSTD_CFLAGS=""
+    if test "x$ADD_NEW_MSVC_FLAGS" = xtrue; then
+      LANGSTD_CFLAGS="-std:c11"
+    fi
   fi
   TOOLCHAIN_CFLAGS_JDK_CONLY="$LANGSTD_CFLAGS $TOOLCHAIN_CFLAGS_JDK_CONLY"
 

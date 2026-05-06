@@ -41,6 +41,7 @@
 #include "os_windows.inline.hpp"
 #include "prims/jniFastGetField.hpp"
 #include "prims/jvm_misc.hpp"
+#include "prims/upcallLinker.hpp"
 #include "runtime/arguments.hpp"
 #include "runtime/atomic.hpp"
 #include "runtime/globals.hpp"
@@ -76,6 +77,7 @@
 #include "utilities/macros.hpp"
 #include "utilities/permitForbiddenFunctions.hpp"
 #include "utilities/population_count.hpp"
+#include "utilities/threadLocalValue.hpp"
 #include "utilities/vmError.hpp"
 #include "windbghelp.hpp"
 #if INCLUDE_JFR
@@ -132,6 +134,483 @@ static FILETIME process_kernel_time;
   #error "Unknown CPU"
 #endif
 
+// GetTickCount64
+static ULONGLONG WINAPI
+CompatGetTickCount64(void)
+{
+    typedef ULONGLONG (WINAPI *PFN_GetTickCount64)(VOID);
+
+    static PFN_GetTickCount64 pGetTickCount64 = NULL;
+    static LONG initState_GTC64 = 0;
+
+    static LONG lock_GTC64 = 0;
+    static DWORD lastLow_GTC64 = 0;
+    static DWORD high32_GTC64 = 0;
+    static LONG haveState_GTC64 = 0;
+
+    if (InterlockedCompareExchange(&initState_GTC64, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetTickCount64 = (PFN_GetTickCount64)
+                GetProcAddress(hKernel32, "GetTickCount64");
+        }
+        InterlockedExchange(&initState_GTC64, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GTC64, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetTickCount64 != NULL) {
+        return pGetTickCount64();
+    }
+
+    while (InterlockedCompareExchange(&lock_GTC64, 1, 0) != 0) {
+        SwitchToThread();
+    }
+
+    DWORD now = GetTickCount();
+
+    if (haveState_GTC64 == 0) {
+        lastLow_GTC64 = now;
+        high32_GTC64 = 0;
+        haveState_GTC64 = 1;
+        InterlockedExchange(&lock_GTC64, 0);
+        return (ULONGLONG)now;
+    }
+
+    if (now < lastLow_GTC64) {
+        high32_GTC64++;
+    }
+
+    lastLow_GTC64 = now;
+
+    ULONGLONG result = (((ULONGLONG)high32_GTC64) << 32) | (ULONGLONG)now;
+
+    InterlockedExchange(&lock_GTC64, 0);
+    return result;
+}
+// end GetTickCount64
+
+// GetFinalPathNameByHandleW
+static DWORD WINAPI
+CompatGetFinalPathNameByHandleW(HANDLE hFile,
+                                LPWSTR lpszFilePath,
+                                DWORD cchFilePath,
+                                DWORD dwFlags)
+{
+    typedef DWORD (WINAPI *PFN_GetFinalPathNameByHandleW)(HANDLE, LPWSTR, DWORD, DWORD);
+
+    static PFN_GetFinalPathNameByHandleW pGetFinalPathNameByHandleW = NULL;
+    static LONG initState_GFPHBH = 0;
+
+    if (InterlockedCompareExchange(&initState_GFPHBH, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetFinalPathNameByHandleW = (PFN_GetFinalPathNameByHandleW)
+                GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
+        }
+        InterlockedExchange(&initState_GFPHBH, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GFPHBH, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetFinalPathNameByHandleW != NULL) {
+        return pGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
+    }
+
+    (void)dwFlags;
+
+    if (hFile == NULL || hFile == INVALID_HANDLE_VALUE) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+
+    typedef LONG NTSTATUS;
+    typedef struct _UNICODE_STRING {
+        USHORT Length;
+        USHORT MaximumLength;
+        PWSTR  Buffer;
+    } UNICODE_STRING;
+
+    typedef struct _OBJECT_NAME_INFORMATION {
+        UNICODE_STRING Name;
+    } OBJECT_NAME_INFORMATION;
+
+    typedef enum _OBJECT_INFORMATION_CLASS {
+        ObjectNameInformation = 1
+    } OBJECT_INFORMATION_CLASS;
+
+    typedef NTSTATUS (NTAPI *PFN_NtQueryObject)(
+        HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+
+    static PFN_NtQueryObject pNtQueryObject = NULL;
+    static LONG initState_NQO = 0;
+
+    if (InterlockedCompareExchange(&initState_NQO, 1, 0) == 0) {
+        HMODULE hNtdll = GetModuleHandle(TEXT("NTDLL.DLL"));
+        if (hNtdll) {
+            pNtQueryObject = (PFN_NtQueryObject)
+                GetProcAddress(hNtdll, "NtQueryObject");
+        }
+        InterlockedExchange(&initState_NQO, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_NQO, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pNtQueryObject == NULL) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return 0;
+    }
+
+    ULONG need = 0;
+    NTSTATUS st = pNtQueryObject(hFile, ObjectNameInformation, NULL, 0, &need);
+
+    if ((ULONG)st != 0xC0000004UL || need == 0) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    OBJECT_NAME_INFORMATION* oni = (OBJECT_NAME_INFORMATION*)os::malloc(need, mtInternal);
+    if (oni == NULL) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+
+    st = pNtQueryObject(hFile, ObjectNameInformation, oni, need, &need);
+    if (st < 0) {
+        os::free(oni);
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    if (oni->Name.Buffer == NULL || oni->Name.Length == 0) {
+        os::free(oni);
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    DWORD ntLen = (DWORD)(oni->Name.Length / sizeof(WCHAR));
+    WCHAR* ntPath = (WCHAR*)os::malloc((ntLen + 1) * sizeof(WCHAR), mtInternal);
+    if (ntPath == NULL) {
+        os::free(oni);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+
+    memcpy(ntPath, oni->Name.Buffer, ntLen * sizeof(WCHAR));
+    ntPath[ntLen] = L'\0';
+
+    os::free(oni);
+
+    WCHAR* finalPath = NULL;
+
+    if (wcsncmp(ntPath, L"\\Device\\Mup\\", 12) == 0) {
+        const WCHAR* tail = ntPath + 12;
+        size_t tailLen = wcslen(tail);
+        size_t outLen = 8 + tailLen; /* "\\?\UNC\" */
+        finalPath = (WCHAR*)os::malloc((outLen + 1) * sizeof(WCHAR), mtInternal);
+        if (finalPath) {
+            wcscpy(finalPath, L"\\\\?\\UNC\\");
+            wcscat(finalPath, tail);
+        }
+    } else {
+        WCHAR drives[512];
+        DWORD dlen = GetLogicalDriveStringsW((DWORD)(sizeof(drives) / sizeof(drives[0])), drives);
+        if (dlen != 0 && dlen < (DWORD)(sizeof(drives) / sizeof(drives[0]))) {
+            WCHAR* p = drives;
+            while (*p) {
+                WCHAR drive[3];
+                WCHAR dev[512];
+
+                drive[0] = p[0];
+                drive[1] = L':';
+                drive[2] = L'\0';
+
+                if (QueryDosDeviceW(drive, dev, (DWORD)(sizeof(dev) / sizeof(dev[0]))) != 0) {
+                    size_t devLen = wcslen(dev);
+                    if (devLen > 0 && wcsncmp(ntPath, dev, devLen) == 0) {
+                        const WCHAR* tail = ntPath + devLen;
+                        size_t tailLen = wcslen(tail);
+
+                        size_t outLen = 4 /* \\?\ */ + 2 /* C: */ + tailLen;
+                        finalPath = (WCHAR*)os::malloc((outLen + 1) * sizeof(WCHAR), mtInternal);
+                        if (finalPath) {
+                            wcscpy(finalPath, L"\\\\?\\");
+                            finalPath[4] = drive[0];
+                            finalPath[5] = L':';
+                            finalPath[6] = L'\0';
+                            wcscat(finalPath, tail);
+                        }
+                        break;
+                    }
+                }
+
+                p += wcslen(p) + 1;
+            }
+        }
+    }
+
+    os::free(ntPath);
+
+    if (finalPath == NULL) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    DWORD outChars = (DWORD)wcslen(finalPath);
+
+    if (lpszFilePath == NULL || cchFilePath == 0 || cchFilePath <= outChars) {
+        os::free(finalPath);
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return outChars + 1;
+    }
+
+    memcpy(lpszFilePath, finalPath, outChars * sizeof(WCHAR));
+    lpszFilePath[outChars] = L'\0';
+
+    os::free(finalPath);
+    return outChars;
+}
+// end GetFinalPathNameByHandleW
+
+// InitOnceExecuteOnce
+static BOOL WINAPI
+CompatInitOnceExecuteOnce(PINIT_ONCE InitOnce,
+                          PINIT_ONCE_FN InitFn,
+                          PVOID Parameter,
+                          LPVOID *Context)
+{
+    typedef BOOL (WINAPI *PFN_InitOnceExecuteOnce)(PINIT_ONCE, PINIT_ONCE_FN, PVOID, LPVOID*);
+
+    static PFN_InitOnceExecuteOnce pInitOnceExecuteOnce = NULL;
+    static LONG initState_IOEO = 0;
+
+    if (InterlockedCompareExchange(&initState_IOEO, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pInitOnceExecuteOnce = (PFN_InitOnceExecuteOnce)
+                GetProcAddress(hKernel32, "InitOnceExecuteOnce");
+        }
+        InterlockedExchange(&initState_IOEO, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_IOEO, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pInitOnceExecuteOnce != NULL) {
+        return pInitOnceExecuteOnce(InitOnce, InitFn, Parameter, Context);
+    }
+
+    if (InitOnce == NULL || InitFn == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    for (;;) {
+        ULONG_PTR val = (ULONG_PTR)InterlockedCompareExchangePointer(&InitOnce->Ptr, NULL, NULL);
+        switch (val & 3) {
+        case 2:
+            if (Context) *Context = (PVOID)(val & ~(ULONG_PTR)3);
+            return TRUE;
+
+        case 0:
+            if ((ULONG_PTR)InterlockedCompareExchangePointer(&InitOnce->Ptr, (PVOID)1, NULL) == 0) {
+                PVOID ctx = NULL;
+                BOOL ok = InitFn(InitOnce, Parameter, &ctx);
+                if (ok) {
+                    if (((ULONG_PTR)ctx & 3) != 0) {
+                        SetLastError(ERROR_INVALID_PARAMETER);
+                        InterlockedExchangePointer(&InitOnce->Ptr, NULL);
+                        return FALSE;
+                    }
+                    InterlockedExchangePointer(&InitOnce->Ptr, (PVOID)((ULONG_PTR)ctx | 2));
+                    if (Context) *Context = ctx;
+                    return TRUE;
+                } else {
+                    InterlockedExchangePointer(&InitOnce->Ptr, NULL);
+                    if (GetLastError() == 0) {
+                        SetLastError(ERROR_GEN_FAILURE);
+                    }
+                    return FALSE;
+                }
+            }
+            break;
+
+        case 1:
+            while ((((ULONG_PTR)InterlockedCompareExchangePointer(&InitOnce->Ptr, NULL, NULL)) & 3) == 1) {
+                SwitchToThread();
+            }
+            break;
+
+        default:
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+    }
+}
+// end InitOnceExecuteOnce
+
+// VirtualAllocExNuma
+static LPVOID WINAPI
+CompatVirtualAllocExNuma(HANDLE hProcess,
+                         LPVOID lpAddress,
+                         SIZE_T dwSize,
+                         DWORD  flAllocationType,
+                         DWORD  flProtect,
+                         DWORD  nndPreferred)
+{
+    typedef LPVOID (WINAPI *PFN_VirtualAllocExNuma)(HANDLE, LPVOID, SIZE_T, DWORD, DWORD, DWORD);
+
+    static PFN_VirtualAllocExNuma pVirtualAllocExNuma = NULL;
+    static LONG initState_VAEN = 0;
+
+    if (InterlockedCompareExchange(&initState_VAEN, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pVirtualAllocExNuma = (PFN_VirtualAllocExNuma)
+                GetProcAddress(hKernel32, "VirtualAllocExNuma");
+        }
+        InterlockedExchange(&initState_VAEN, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_VAEN, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pVirtualAllocExNuma != NULL) {
+        return pVirtualAllocExNuma(hProcess, lpAddress, dwSize, flAllocationType, flProtect, nndPreferred);
+    }
+
+    (void)nndPreferred;
+    return VirtualAllocEx(hProcess, lpAddress, dwSize, flAllocationType, flProtect);
+}
+// end VirtualAllocExNuma
+
+// GetActiveProcessorCount
+static DWORD WINAPI
+CompatGetActiveProcessorCount(WORD GroupNumber)
+{
+    typedef DWORD (WINAPI *PFN_GetActiveProcessorCount)(WORD);
+
+    static PFN_GetActiveProcessorCount pGetActiveProcessorCount = NULL;
+    static LONG initState_GAPC = 0;
+
+    if (InterlockedCompareExchange(&initState_GAPC, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetActiveProcessorCount = (PFN_GetActiveProcessorCount)
+                GetProcAddress(hKernel32, "GetActiveProcessorCount");
+        }
+        InterlockedExchange(&initState_GAPC, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GAPC, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetActiveProcessorCount != NULL) {
+        return pGetActiveProcessorCount(GroupNumber);
+    }
+
+    DWORD saved_le = GetLastError();
+
+    if (GroupNumber == ALL_PROCESSOR_GROUPS || GroupNumber == 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        SetLastError(saved_le);
+        return si.dwNumberOfProcessors;
+    }
+
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return 0;
+}
+// end GetActiveProcessorCount
+
+// GetProcessGroupAffinity
+static BOOL WINAPI
+CompatGetProcessGroupAffinity(HANDLE hProcess, PUSHORT GroupCount, PUSHORT GroupArray)
+{
+    typedef BOOL (WINAPI *PFN_GetProcessGroupAffinity)(HANDLE, PUSHORT, PUSHORT);
+
+    static PFN_GetProcessGroupAffinity pGetProcessGroupAffinity = NULL;
+    static LONG initState_GPGA = 0;
+
+    if (InterlockedCompareExchange(&initState_GPGA, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetProcessGroupAffinity = (PFN_GetProcessGroupAffinity)
+                GetProcAddress(hKernel32, "GetProcessGroupAffinity");
+        }
+        InterlockedExchange(&initState_GPGA, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GPGA, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetProcessGroupAffinity != NULL) {
+        return pGetProcessGroupAffinity(hProcess, GroupCount, GroupArray);
+    }
+
+    (void)hProcess;
+
+    if (GroupCount == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    DWORD saved_le = GetLastError();
+
+    if (GroupArray == NULL || *GroupCount < 1) {
+        *GroupCount = 1;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    GroupArray[0] = 0;
+    *GroupCount = 1;
+
+    SetLastError(saved_le);
+    return TRUE;
+}
+// end GetProcessGroupAffinity
+
+// GetLargePageMinimum
+static SIZE_T WINAPI
+CompatGetLargePageMinimum(void)
+{
+    typedef SIZE_T (WINAPI *PFN_GetLargePageMinimum)(void);
+
+    static PFN_GetLargePageMinimum pGetLargePageMinimum = NULL;
+    static LONG initState_GLPM = 0;
+
+    if (InterlockedCompareExchange(&initState_GLPM, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetLargePageMinimum = (PFN_GetLargePageMinimum)
+                GetProcAddress(hKernel32, "GetLargePageMinimum");
+        }
+        InterlockedExchange(&initState_GLPM, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GLPM, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetLargePageMinimum != NULL) {
+        return pGetLargePageMinimum();
+    }
+
+    return (SIZE_T)(*(volatile ULONG *)((ULONG_PTR)0x7FFE0000 + 0x244));
+}
+// end GetLargePageMinimum
+
 #if defined(USE_VECTORED_EXCEPTION_HANDLING)
 PVOID  topLevelVectoredExceptionHandler = nullptr;
 LPTOP_LEVEL_EXCEPTION_FILTER previousUnhandledExceptionFilter = nullptr;
@@ -167,7 +646,14 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
   case DLL_PROCESS_ATTACH:
     windows_preinit(hinst);
     break;
+  case DLL_THREAD_DETACH:
+    thread_local_value_on_thread_detach();
+    UpcallLinker::on_thread_detach();
+    break;
   case DLL_PROCESS_DETACH:
+    if (reserved != nullptr) {
+      thread_local_value_on_process_detach();
+    }
     windows_atexit();
     break;
   default:
@@ -229,7 +715,7 @@ static BOOL virtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD  dwFreeType) {
 // Logging wrapper for VirtualAllocExNuma
 static LPVOID virtualAllocExNuma(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD  flAllocationType,
                                  DWORD  flProtect, DWORD  nndPreferred) {
-  LPVOID result = ::VirtualAllocExNuma(hProcess, lpAddress, dwSize, flAllocationType, flProtect, nndPreferred);
+  LPVOID result = ::CompatVirtualAllocExNuma(hProcess, lpAddress, dwSize, flAllocationType, flProtect, nndPreferred);
   if (result != nullptr) {
     log_trace(os)("VirtualAllocExNuma(" PTR_FORMAT ", %zu, %x, %x, %x) returned " PTR_FORMAT "%s.",
                   p2i(lpAddress), dwSize, flAllocationType, flProtect, nndPreferred, p2i(result),
@@ -958,7 +1444,7 @@ int os::active_processor_count() {
   bool use_process_affinity_mask = false;
   bool got_process_group_affinity = false;
 
-  if (GetProcessGroupAffinity(GetCurrentProcess(), &group_count, nullptr) == 0) {
+  if (CompatGetProcessGroupAffinity(GetCurrentProcess(), &group_count, nullptr) == 0) {
     DWORD last_error = GetLastError();
     if (last_error == ERROR_INSUFFICIENT_BUFFER) {
       if (group_count > 0) {
@@ -1901,7 +2387,7 @@ void os::print_os_info_brief(outputStream* st) {
 }
 
 void os::win32::print_uptime_info(outputStream* st) {
-  unsigned long long ticks = GetTickCount64();
+  unsigned long long ticks = CompatGetTickCount64();
   os::print_dhm(st, "OS uptime:", ticks/1000);
 }
 
@@ -3130,7 +3616,7 @@ size_t os::win32::large_page_init_decide_size() {
     return 0;
   }
 
-  size_t size = GetLargePageMinimum();
+  size_t size = CompatGetLargePageMinimum();
   if (size == 0) {
     WARN("Large page is not supported by the processor.");
     return 0;
@@ -3168,7 +3654,7 @@ void os::large_page_init() {
   if (_large_page_size > default_page_size) {
 #if !defined(IA32)
     if (EnableAllLargePageSizesForWindows) {
-      size_t min_size = GetLargePageMinimum();
+      size_t min_size = CompatGetLargePageMinimum();
 
       // Populate _page_sizes with large page sizes less than or equal to _large_page_size, ensuring each page size is double the size of the previous one.
       for (size_t page_size = min_size; page_size < _large_page_size; page_size *= 2) {
@@ -3447,7 +3933,7 @@ char* os::pd_reserve_memory_special(size_t bytes, size_t alignment, size_t page_
   }
 
   // Ensure GetLargePageMinimum() returns a valid positive value
-  size_t large_page_min = GetLargePageMinimum();
+  size_t large_page_min = CompatGetLargePageMinimum();
   if (large_page_min <= 0) {
     return nullptr;
   }
@@ -4112,7 +4598,7 @@ void os::win32::initialize_system_info() {
   DWORD processors = 0;
   bool schedules_all_processor_groups = win32::is_windows_11_or_greater() || win32::is_windows_server_2022_or_greater();
   if (schedules_all_processor_groups) {
-    processors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    processors = CompatGetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     if (processors == 0) {
       char buf[512];
       size_t buf_len = os::lasterror(buf, sizeof(buf));
@@ -4226,7 +4712,7 @@ static void exit_process_or_thread(Ept what, int exit_code) {
     bool registered = false;
 
     // The first thread that reached this point, initializes the critical section.
-    if (!InitOnceExecuteOnce(&init_once_crit_sect, init_crit_sect_call, &crit_sect, nullptr)) {
+    if (!CompatInitOnceExecuteOnce(&init_once_crit_sect, init_crit_sect_call, &crit_sect, nullptr)) {
       warning("crit_sect initialization failed in %s: %d\n", __FILE__, __LINE__);
     } else if (Atomic::load_acquire(&process_exiting) == 0) {
       if (what != EPT_THREAD) {
@@ -4652,7 +5138,7 @@ static WCHAR* get_path_to_target(const wchar_t* wide_path) {
   }
 
   // Returned value includes the terminating null character.
-  const size_t target_path_size = ::GetFinalPathNameByHandleW(hFile, nullptr, 0,
+  const size_t target_path_size = ::CompatGetFinalPathNameByHandleW(hFile, nullptr, 0,
                                                               FILE_NAME_NORMALIZED);
   if (target_path_size == 0) {
     errno = ::GetLastError();
@@ -4663,7 +5149,7 @@ static WCHAR* get_path_to_target(const wchar_t* wide_path) {
   WCHAR* path_to_target = NEW_C_HEAP_ARRAY(WCHAR, target_path_size, mtInternal);
 
   // The returned size is the length excluding the terminating null character.
-  const size_t res = ::GetFinalPathNameByHandleW(hFile, path_to_target, static_cast<DWORD>(target_path_size),
+  const size_t res = ::CompatGetFinalPathNameByHandleW(hFile, path_to_target, static_cast<DWORD>(target_path_size),
                                                  FILE_NAME_NORMALIZED);
   if (res != target_path_size - 1) {
     errno = ::GetLastError();
@@ -5695,7 +6181,7 @@ PlatformMutex::~PlatformMutex() {
 }
 
 PlatformMonitor::PlatformMonitor() {
-  InitializeConditionVariable(&_cond);
+  CompatInitializeConditionVariable(&_cond);
 }
 
 PlatformMonitor::~PlatformMonitor() {
@@ -5709,7 +6195,7 @@ int PlatformMonitor::wait(uint64_t millis) {
   if (millis > UINT_MAX) {
     millis = UINT_MAX;
   }
-  int status = SleepConditionVariableCS(&_cond, &_mutex,
+  int status = CompatSleepConditionVariableCS(&_cond, &_mutex,
                                         millis == 0 ? INFINITE : (DWORD)millis);
   if (status != 0) {
     ret = OS_OK;

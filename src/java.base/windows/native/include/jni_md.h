@@ -35,4 +35,10 @@ typedef int jint;
 typedef long long jlong;
 typedef signed char jbyte;
 
+#if defined(_MSC_VER) && !defined(__cplusplus) && (_MSC_VER < 1928)
+  #ifndef _Alignas
+    #define _Alignas(x) __declspec(align(x))
+  #endif
+#endif
+
 #endif /* !_JAVASOFT_JNI_MD_H_ */

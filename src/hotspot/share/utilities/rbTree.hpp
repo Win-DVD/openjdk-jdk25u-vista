@@ -30,6 +30,7 @@
 #include "runtime/os.hpp"
 #include "utilities/globalDefinitions.hpp"
 #include <type_traits>
+#include <utility>
 
 // An intrusive red-black tree is constructed with two template parameters:
 // K is the key type used.
@@ -198,43 +199,45 @@ protected:
 private:
   template <typename CMP, typename RET, typename ARG1, typename ARG2, typename = void>
   struct has_cmp_type : std::false_type {};
+
   template <typename CMP, typename RET, typename ARG1, typename ARG2>
-  struct has_cmp_type<CMP, RET, ARG1, ARG2, decltype(static_cast<RET(*)(ARG1, ARG2)>(CMP::cmp), void())> : std::true_type {};
+  struct has_cmp_type<CMP, RET, ARG1, ARG2,
+      decltype((void)static_cast<RET>(CMP::cmp(std::declval<ARG1>(), std::declval<ARG2>())))> : std::true_type {};
 
   template <typename CMP>
-  static constexpr bool HasKeyComparator = has_cmp_type<CMP, int, K, K>::value;
+  struct HasKeyComparator : has_cmp_type<CMP, int, K, K> {};
 
   template <typename CMP>
-  static constexpr bool HasNodeComparator = has_cmp_type<CMP, int, K, const NodeType*>::value;
+  struct HasNodeComparator : has_cmp_type<CMP, int, K, const NodeType*> {};
 
   template <typename CMP>
-  static constexpr bool HasNodeVerifier = has_cmp_type<CMP, bool, const NodeType*, const NodeType*>::value;
+  struct HasNodeVerifier : has_cmp_type<CMP, bool, const NodeType*, const NodeType*> {};
 
-  template <typename CMP = COMPARATOR, ENABLE_IF(HasKeyComparator<CMP> && !HasNodeComparator<CMP>)>
+  template <typename CMP = COMPARATOR, ENABLE_IF(HasKeyComparator<CMP>::value && !HasNodeComparator<CMP>::value)>
   int cmp(const K& a, const NodeType* b) const {
     return COMPARATOR::cmp(a, b->key());
   }
 
-  template <typename CMP = COMPARATOR, ENABLE_IF(HasNodeComparator<CMP>)>
+  template <typename CMP = COMPARATOR, ENABLE_IF(HasNodeComparator<CMP>::value)>
   int cmp(const K& a, const NodeType* b) const {
     return COMPARATOR::cmp(a, b);
   }
 
-  template <typename CMP = COMPARATOR, ENABLE_IF(!HasNodeVerifier<CMP>)>
+  template <typename CMP = COMPARATOR, ENABLE_IF(!HasNodeVerifier<CMP>::value)>
   bool cmp(const NodeType* a, const NodeType* b) const {
     return true;
   }
 
-  template <typename CMP = COMPARATOR, ENABLE_IF(HasNodeVerifier<CMP>)>
+  template <typename CMP = COMPARATOR, ENABLE_IF(HasNodeVerifier<CMP>::value)>
   bool cmp(const NodeType* a, const NodeType* b) const {
     return COMPARATOR::cmp(a, b);
   }
 
   // Cannot assert if no key comparator exist.
-  template <typename CMP = COMPARATOR, ENABLE_IF(!HasKeyComparator<CMP>)>
+  template <typename CMP = COMPARATOR, ENABLE_IF(!HasKeyComparator<CMP>::value)>
   void assert_key_leq(K a, K b) const {}
 
-  template <typename CMP = COMPARATOR, ENABLE_IF(HasKeyComparator<CMP>)>
+  template <typename CMP = COMPARATOR, ENABLE_IF(HasKeyComparator<CMP>::value)>
   void assert_key_leq(K a, K b) const {
     assert(COMPARATOR::cmp(a, b) <= 0, "key a must be less or equal to key b");
   }
@@ -265,7 +268,7 @@ public:
 
   AbstractRBTree() : _num_nodes(0), _root(nullptr) DEBUG_ONLY(COMMA _expected_visited(false)) {
     static_assert(std::is_trivially_destructible<K>::value, "key type must be trivially destructable");
-    static_assert(HasKeyComparator<COMPARATOR> || HasNodeComparator<COMPARATOR>,
+    static_assert(HasKeyComparator<COMPARATOR>::value || HasNodeComparator<COMPARATOR>::value,
                   "comparator must be of correct type");
   }
 
@@ -413,17 +416,17 @@ public:
   // Verifies that the tree is correct and holds rb-properties
   // If not using a key comparator (when using IntrusiveRBTree for example),
   // A second `cmp` must exist in COMPARATOR (see top of file).
-  template <typename CMP = COMPARATOR, ENABLE_IF(HasNodeVerifier<CMP>)>
+  template <typename CMP = COMPARATOR, ENABLE_IF(HasNodeVerifier<CMP>::value)>
   void verify_self() const {
     verify_self([](const NodeType* a, const NodeType* b){ return COMPARATOR::cmp(a, b);});
   }
 
-  template <typename CMP = COMPARATOR, ENABLE_IF(HasKeyComparator<CMP> && !HasNodeVerifier<CMP>)>
+  template <typename CMP = COMPARATOR, ENABLE_IF(HasKeyComparator<CMP>::value && !HasNodeVerifier<CMP>::value)>
   void verify_self() const {
     verify_self([](const NodeType* a, const NodeType* b){ return COMPARATOR::cmp(a->key(), b->key()) < 0; });
   }
 
-  template <typename CMP = COMPARATOR, ENABLE_IF(HasNodeComparator<CMP> && !HasKeyComparator<CMP> && !HasNodeVerifier<CMP>)>
+  template <typename CMP = COMPARATOR, ENABLE_IF(HasNodeComparator<CMP>::value && !HasKeyComparator<CMP>::value && !HasNodeVerifier<CMP>::value)>
   void verify_self() const {
     verify_self([](const NodeType*, const NodeType*){ return true;});
   }

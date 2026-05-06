@@ -32,6 +32,7 @@
 #include "runtime/jniHandles.inline.hpp"
 #include "utilities/checkedCast.hpp"
 #include "utilities/globalDefinitions.hpp"
+#include "utilities/threadLocalValue.hpp"
 
 #define FOREIGN_ABI "jdk/internal/foreign/abi/"
 
@@ -55,7 +56,11 @@ struct UpcallContext {
   }
 };
 
-APPROVED_CPP_THREAD_LOCAL UpcallContext threadContext;
+static ThreadLocalValue<UpcallContext> threadContext;
+
+static UpcallContext* upcall_context() {
+  return &threadContext.value();
+}
 
 JavaThread* UpcallLinker::maybe_attach_and_get_thread() {
   JavaThread* thread = JavaThread::current_or_null();
@@ -65,7 +70,7 @@ JavaThread* UpcallLinker::maybe_attach_and_get_thread() {
     jint result = vm->functions->AttachCurrentThreadAsDaemon(vm, (void**) &p_env, nullptr);
     guarantee(result == JNI_OK, "Could not attach thread for upcall. JNI error code: %d", result);
     thread = JavaThread::current();
-    threadContext.attachedThread = thread;
+    upcall_context()->attachedThread = thread;
     assert(!thread->has_last_Java_frame(), "newly-attached thread not expected to have last Java frame");
   }
   return thread;
@@ -136,6 +141,12 @@ void UpcallLinker::handle_uncaught_exception(oop exception) {
   java_lang_Throwable::print_stack_trace(exception_h, tty);
   fatal("Unrecoverable uncaught exception encountered");
 }
+
+#if defined(_WIN32)
+void UpcallLinker::on_thread_detach() {
+  threadContext.release_current_thread();
+}
+#endif
 
 JVM_ENTRY(jlong, UL_MakeUpcallStub(JNIEnv *env, jclass unused, jobject mh, jobject abi, jobject conv,
                                                  jboolean needs_return_buffer, jlong ret_buf_size))

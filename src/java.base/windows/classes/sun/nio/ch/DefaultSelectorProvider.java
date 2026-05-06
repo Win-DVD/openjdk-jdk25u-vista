@@ -30,7 +30,18 @@ package sun.nio.ch;
  */
 
 public class DefaultSelectorProvider {
-    private static final SelectorProviderImpl INSTANCE = new WEPollSelectorProvider();
+    private static final SelectorProviderImpl INSTANCE = create();
+
+    private static SelectorProviderImpl create() {
+        boolean useWEPoll = Boolean.getBoolean("jdk.nio.useWEPoll");
+        if (useWEPoll) {
+            try {
+                return new WEPollSelectorProvider();
+            } catch (Throwable t) {
+            }
+        }
+        return new WindowsSelectorProvider();
+    }
 
     /**
      * Prevent instantiation.

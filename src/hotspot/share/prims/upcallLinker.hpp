@@ -45,6 +45,10 @@ public:
 
   // public for stubGenerator
   static void handle_uncaught_exception(oop exception);
+
+#if defined(_WIN32)
+  static void on_thread_detach();
+#endif
 };
 
 #endif // SHARE_VM_PRIMS_UPCALLLINKER_HPP

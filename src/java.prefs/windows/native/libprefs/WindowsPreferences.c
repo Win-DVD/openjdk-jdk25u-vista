@@ -202,7 +202,7 @@ Java_java_util_prefs_WindowsPreferences_WindowsRegQueryInfoKey(JNIEnv* env,
     tmp[2] = valuesNumber;
     tmp[3] = maxSubKeyLength;
     tmp[4] = maxValueNameLength;
-    jintArray result = (*env)->NewLongArray(env, 5);
+    jlongArray result = (*env)->NewLongArray(env, 5);
     if (result != NULL) {
         (*env)->SetLongArrayRegion(env, result, 0, 5, tmp);
     }
